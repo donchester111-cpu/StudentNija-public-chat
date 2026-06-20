@@ -1,7 +1,7 @@
 {
   "name": "studentnija-chat-server",
   "version": "1.0.0",
-  "description": "Self-hosted real-time chat server for StudentNija study groups",
+  "description": "Self-hosted real-time chat server for StudentNija study groups chat",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
