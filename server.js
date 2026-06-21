@@ -6,22 +6,25 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', 1);
 
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: "*",
-    methods: ["GET", "POST"]
-  }
+    methods: ["GET", "POST"],
+    allowedHeaders: ["Content-Type"],
+    credentials: true
+  },
+  transports: ['websocket', 'polling'],
+  allowEIO3: true
 });
 
-// ─── In‑memory storage ───
 const groups = {};
 
 io.on('connection', (socket) => {
   console.log('✅ User connected:', socket.id);
 
-  // ─── Join a group ───
   socket.on('joinGroup', (data) => {
     const { groupId, userName, userId } = data;
     socket.join(groupId);
@@ -41,11 +44,9 @@ io.on('connection', (socket) => {
       messages: groups[groupId].messages.slice(-50)
     });
     io.to(groupId).emit('membersUpdate', groups[groupId].members);
-
     console.log(`📥 ${userName} joined ${groupId}`);
   });
 
-  // ─── Send a message ───
   socket.on('sendMessage', (data) => {
     const { groupId, text, senderName, senderId, timestamp } = data;
     const message = {
@@ -57,18 +58,15 @@ io.on('connection', (socket) => {
     };
     if (groups[groupId]) {
       groups[groupId].messages.push(message);
-      if (groups[groupId].messages.length > 500) {
-        groups[groupId].messages.shift();
-      }
+      if (groups[groupId].messages.length > 500) groups[groupId].messages.shift();
     }
     io.to(groupId).emit('newMessage', message);
-    socket.emit('newMessage', message); // echo to sender
+    socket.emit('newMessage', message);
   });
 
-  // ─── AI request (dummy) ───
   socket.on('requestAI', (data) => {
-    const { groupId, prompt, context } = data;
-    // Replace this with a call to your AI proxy if desired
+    const { groupId, prompt } = data;
+    // You can replace with your own AI call here
     const aiReply = `🤖 AI: I'm a self-hosted AI! (You asked: "${prompt}")`;
     io.to(groupId).emit('newMessage', {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
@@ -79,13 +77,11 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ─── Typing indicator ───
   socket.on('typing', (data) => {
     const { groupId, senderName, senderId } = data;
     socket.to(groupId).emit('typing', { senderName, senderId });
   });
 
-  // ─── Leave group / disconnect ───
   socket.on('leaveGroup', () => {
     const groupId = socket.data.groupId;
     const userId = socket.data.userId;
@@ -108,6 +104,10 @@ io.on('connection', (socket) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', groups: Object.keys(groups).length });
+});
+
+app.get('/', (req, res) => {
+  res.send('🚀 StudentNija Chat Server is running!');
 });
 
 const PORT = process.env.PORT || 3000;
