@@ -15,21 +15,14 @@ const io = new Server(server, {
   allowEIO3: true
 });
 
-// ============================================================
-// CONFIG
-// ============================================================
 const PROXY_URL = process.env.PROXY_URL || "https://studentnija-proxy.donchester111.workers.dev";
 const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant";
 const AI_SYSTEM_PROMPT = `You are StudentNija, an advanced AI study assistant for Nigerian students.
 You are helpful, thorough, and encouraging. Use markdown for formatting.
 If you don't know something, say so honestly. Current date: ${new Date().toLocaleDateString()}.`;
 
-// In‑memory store
 const groups = {};
 
-// ============================================================
-// AI HELPER
-// ============================================================
 async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, personality = "Friendly Tutor") {
   try {
     const response = await fetch(`${PROXY_URL}/groq`, {
@@ -54,15 +47,10 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
   }
 }
 
-// ============================================================
-// SOCKET.IO
-// ============================================================
 io.on('connection', (socket) => {
   console.log('✅ Connected:', socket.id);
 
-  // ------------------------------------------------------------
-  // CREATE GROUP
-  // ------------------------------------------------------------
+  // --- CREATE GROUP ---
   socket.on('createGroup', (data, callback) => {
     const { groupId, userName, userId, description = '', avatar = '' } = data;
     const trimmed = groupId?.trim();
@@ -77,7 +65,7 @@ io.on('connection', (socket) => {
       admins: [userId],
       members: [{ id: userId, name: userName }],
       messages: [],
-      pinned: null // pinned message id
+      pinned: null
     };
 
     socket.join(trimmed);
@@ -88,17 +76,13 @@ io.on('connection', (socket) => {
     io.to(trimmed).emit('membersUpdate', groups[trimmed].members);
   });
 
-  // ------------------------------------------------------------
-  // JOIN GROUP (only if exists)
-  // ------------------------------------------------------------
+  // --- JOIN GROUP ---
   socket.on('joinGroup', (data) => {
     const { groupId, userName, userId } = data;
     if (!groups[groupId]) return socket.emit('groupNotFound', { groupId });
-
     socket.join(groupId);
     socket.data.groupId = groupId;
     socket.data.userId = userId;
-
     if (!groups[groupId].members.find(m => m.id === userId)) {
       groups[groupId].members.push({ id: userId, name: userName });
     }
@@ -115,13 +99,10 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('membersUpdate', groups[groupId].members);
   });
 
-  // ------------------------------------------------------------
-  // SEND MESSAGE (with reply support)
-  // ------------------------------------------------------------
+  // --- SEND MESSAGE (with reply) ---
   socket.on('sendMessage', (data) => {
     const { groupId, text, senderName, senderId, timestamp, replyToId } = data;
     if (!groups[groupId]) return;
-
     let replyTo = null;
     if (replyToId) {
       const original = groups[groupId].messages.find(m => m.id === replyToId);
@@ -133,7 +114,6 @@ io.on('connection', (socket) => {
         };
       }
     }
-
     const message = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
       senderId,
@@ -141,34 +121,33 @@ io.on('connection', (socket) => {
       text,
       timestamp: timestamp || new Date().toISOString(),
       reactions: {},
-      replyTo: replyTo,
+      replyTo,
       edited: false,
       deleted: false,
-      deletedFor: [] // userIds who have deleted it for themselves
+      deletedFor: []
     };
-
     groups[groupId].messages.push(message);
     if (groups[groupId].messages.length > 500) groups[groupId].messages.shift();
     io.to(groupId).emit('newMessage', message);
   });
 
-  // ------------------------------------------------------------
-  // AI REQUEST (with typing indicator)
-  // ------------------------------------------------------------
+  // --- UPGRADED AI REQUEST (context‑aware) ---
   socket.on('requestAI', async (data) => {
-    const { groupId, prompt, context = '', personality = 'Friendly Tutor' } = data;
+    const { groupId, prompt, context = '', personality = 'Friendly Tutor', senderName, senderId } = data;
     if (!groups[groupId]) return;
 
-    // Tell everyone AI is typing
     io.to(groupId).emit('aiTyping', { typing: true });
 
-    const fullPrompt = context ? `Previous messages:\n${context}\n\nUser question: ${prompt}` : prompt;
-    const aiReply = await callAIHelper(fullPrompt, AI_SYSTEM_PROMPT, personality);
+    const history = context ? `Here is the recent conversation:\n${context}\n\n` : '';
+    const userInfo = senderName ? `The user asking is "${senderName}" (ID: ${senderId}).` : '';
+    const fullPrompt = `${history}${userInfo}\nNow, answer this question from ${senderName || 'the user'}: "${prompt}". 
+      Address the user by their name (if provided) and be helpful, friendly, and concise.
+      If you are unsure, say so honestly.`;
 
-    // Stop typing indicator
+    const aiReply = await callAIHelper(fullPrompt, AI_SYSTEM_PROMPT, personality);
     io.to(groupId).emit('aiTyping', { typing: false });
 
-    const replyText = aiReply || `✦ I'm sorry, I couldn't reach my AI brain right now. Please try again later.`;
+    const replyText = aiReply || `✦ I'm sorry, Something went wrong. Please try again later.`;
     const message = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
       senderId: 'ai_bot',
@@ -181,34 +160,27 @@ io.on('connection', (socket) => {
       deleted: false,
       deletedFor: []
     };
-
     groups[groupId].messages.push(message);
     if (groups[groupId].messages.length > 500) groups[groupId].messages.shift();
     io.to(groupId).emit('newMessage', message);
   });
 
-  // ------------------------------------------------------------
-  // REACTION (toggle)
-  // ------------------------------------------------------------
+  // --- REACTION ---
   socket.on('react', (data) => {
     const { groupId, messageId, emoji, userId } = data;
     if (!groups[groupId]) return;
     const msg = groups[groupId].messages.find(m => m.id === messageId);
     if (!msg || msg.deleted) return;
-
     if (!msg.reactions) msg.reactions = {};
     if (!msg.reactions[emoji]) msg.reactions[emoji] = [];
     const idx = msg.reactions[emoji].indexOf(userId);
     if (idx === -1) msg.reactions[emoji].push(userId);
     else msg.reactions[emoji].splice(idx, 1);
     if (msg.reactions[emoji].length === 0) delete msg.reactions[emoji];
-
     io.to(groupId).emit('reactionUpdate', { messageId, reactions: msg.reactions });
   });
 
-  // ------------------------------------------------------------
-  // EDIT MESSAGE
-  // ------------------------------------------------------------
+  // --- EDIT MESSAGE ---
   socket.on('editMessage', (data) => {
     const { groupId, messageId, newText, userId } = data;
     if (!groups[groupId]) return;
@@ -220,9 +192,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('messageEdited', { messageId, newText, editedAt: msg.editedAt });
   });
 
-  // ------------------------------------------------------------
-  // DELETE MESSAGE (for self or all)
-  // ------------------------------------------------------------
+  // --- DELETE MESSAGE ---
   socket.on('deleteMessage', (data) => {
     const { groupId, messageId, userId, forAll } = data;
     if (!groups[groupId]) return;
@@ -242,9 +212,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ------------------------------------------------------------
-  // PIN / UNPIN MESSAGE
-  // ------------------------------------------------------------
+  // --- PIN / UNPIN ---
   socket.on('pinMessage', (data) => {
     const { groupId, messageId, userId } = data;
     if (!groups[groupId]) return;
@@ -261,9 +229,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ------------------------------------------------------------
-  // GROUP ADMIN ACTIONS
-  // ------------------------------------------------------------
+  // --- ADMIN ACTIONS ---
   socket.on('toggleAdmin', (data) => {
     const { groupId, userId, targetUserId, add } = data;
     if (!groups[groupId]) return;
@@ -324,17 +290,13 @@ io.on('connection', (socket) => {
     } else socket.emit('error', { message: 'Not authorized' });
   });
 
-  // ------------------------------------------------------------
-  // TYPING (user typing)
-  // ------------------------------------------------------------
+  // --- TYPING ---
   socket.on('typing', (data) => {
     const { groupId, senderName, senderId } = data;
     socket.to(groupId).emit('typing', { senderName, senderId });
   });
 
-  // ------------------------------------------------------------
-  // LEAVE / DISCONNECT
-  // ------------------------------------------------------------
+  // --- LEAVE / DISCONNECT ---
   socket.on('leaveGroup', () => {
     const gid = socket.data.groupId;
     const uid = socket.data.userId;
@@ -356,13 +318,9 @@ io.on('connection', (socket) => {
   });
 });
 
-// ============================================================
-// REST ENDPOINTS
-// ============================================================
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', groups: Object.keys(groups).length });
-});
-app.get('/', (req, res) => res.send('🚀 StudentNija Chat Server (Full WhatsApp‑like) running!'));
+// --- REST ---
+app.get('/health', (req, res) => res.json({ status: 'ok', groups: Object.keys(groups).length }));
+app.get('/', (req, res) => res.send('🚀 StudentNija Chat Server (AI Context‑Aware) running!'));
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`🚀 Server on port ${PORT}`));
