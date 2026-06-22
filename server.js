@@ -20,31 +20,78 @@ const io = new Server(server, {
   allowEIO3: true
 });
 
+// ============================================================
+// CONFIG
+// ============================================================
+const PROXY_URL = process.env.PROXY_URL || "https://studentnija-proxy.donchester111.workers.dev";
+const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant"; // Groq model
+const AI_SYSTEM_PROMPT = `You are StudentNija, an advanced AI study assistant for Nigerian students.
+You are helpful, thorough, and encouraging. Use markdown for formatting.
+If you don't know something, say so honestly. Current date: ${new Date().toLocaleDateString()}.`;
+
+// In‑memory store: groups[groupId] = { members, messages, createdBy, name }
 const groups = {};
 
-io.on('connection', (socket) => {
-  console.log('✅ Connected:', socket.id);
+// ============================================================
+// AI HELPER (calls the proxy)
+// ============================================================
+async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, personality = "Friendly Tutor") {
+  const messages = [
+    { role: "system", content: systemPrompt + ` Personality: ${personality}.` },
+    { role: "user", content: userPrompt }
+  ];
 
-  // Join a group
+  try {
+    const response = await fetch(`${PROXY_URL}/groq`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 500
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Proxy error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    if (data.choices && data.choices[0] && data.choices[0].message) {
+      return data.choices[0].message.content;
+    } else {
+      throw new Error('Unexpected response format from AI');
+    }
+  } catch (err) {
+    console.error('AI error:', err.message);
+    return null; // caller will handle fallback
+  }
+}
+
+// ============================================================
+// SOCKET.IO
+// ============================================================
+io.on('connection', (socket) => {
+  console.log('✓ Connected:', socket.id);
+
+  // ------------------------------------------------------------
+  // JOIN GROUP (only if exists)
+  // ------------------------------------------------------------
   socket.on('joinGroup', (data) => {
     const { groupId, userName, userId } = data;
+
+    if (!groups[groupId]) {
+      socket.emit('groupNotFound', { groupId });
+      return;
+    }
+
     socket.join(groupId);
     socket.data.groupId = groupId;
     socket.data.userName = userName;
     socket.data.userId = userId;
 
-    if (!groups[groupId]) {
-      groups[groupId] = {
-        members: [],
-        messages: [],
-        createdBy: userId,
-        name: groupId
-      };
-    }
-    // Set creator if not set
-    if (!groups[groupId].createdBy) {
-      groups[groupId].createdBy = userId;
-    }
     if (!groups[groupId].members.find(m => m.id === userId)) {
       groups[groupId].members.push({ id: userId, name: userName });
     }
@@ -57,7 +104,9 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('membersUpdate', groups[groupId].members);
   });
 
-  // Send message (FIX: no duplicate)
+  // ------------------------------------------------------------
+  // SEND MESSAGE
+  // ------------------------------------------------------------
   socket.on('sendMessage', (data) => {
     const { groupId, text, senderName, senderId, timestamp } = data;
     const message = {
@@ -65,27 +114,43 @@ io.on('connection', (socket) => {
       senderId,
       senderName,
       text,
-      timestamp: timestamp || new Date().toISOString()
+      timestamp: timestamp || new Date().toISOString(),
+      reactions: {} // initial empty reactions
     };
+
     if (groups[groupId]) {
       groups[groupId].messages.push(message);
       if (groups[groupId].messages.length > 500) groups[groupId].messages.shift();
     }
-    // Broadcast to ALL in group (including sender) – no separate echo
     io.to(groupId).emit('newMessage', message);
   });
 
-  // AI request
-  socket.on('requestAI', (data) => {
-    const { groupId, prompt } = data;
-    const aiReply = `🤖 AI: (You asked: "${prompt}") – I'll help you study!`;
+  // ------------------------------------------------------------
+  // AI REQUEST – real AI via proxy
+  // ------------------------------------------------------------
+  socket.on('requestAI', async (data) => {
+    const { groupId, prompt, context = '', personality = 'Friendly Tutor' } = data;
+
+    // Build full prompt with context
+    let fullPrompt = prompt;
+    if (context) {
+      fullPrompt = `Previous messages:\n${context}\n\nUser question: ${prompt}`;
+    }
+
+    let aiReply = await callAIHelper(fullPrompt, AI_SYSTEM_PROMPT, personality);
+    if (!aiReply) {
+      aiReply = `I'm sorry, I couldn't reach my AI brain right now. Please try again later.`;
+    }
+
     const message = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
       senderId: 'ai_bot',
-      senderName: '🤖 StudentNija AI',
+      senderName: '✦ StudentNija AI',
       text: aiReply,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      reactions: {}
     };
+
     if (groups[groupId]) {
       groups[groupId].messages.push(message);
       if (groups[groupId].messages.length > 500) groups[groupId].messages.shift();
@@ -93,41 +158,66 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('newMessage', message);
   });
 
-  // Typing
+  // ------------------------------------------------------------
+  // REACTION – toggle emoji reaction on a message
+  // ------------------------------------------------------------
+  socket.on('react', (data) => {
+    const { groupId, messageId, emoji, userId } = data;
+    if (!groups[groupId]) return;
+    const msg = groups[groupId].messages.find(m => m.id === messageId);
+    if (!msg) return;
+
+    if (!msg.reactions) msg.reactions = {};
+    if (!msg.reactions[emoji]) msg.reactions[emoji] = [];
+
+    const userIndex = msg.reactions[emoji].indexOf(userId);
+    if (userIndex === -1) {
+      // add reaction
+      msg.reactions[emoji].push(userId);
+    } else {
+      // remove reaction (toggle)
+      msg.reactions[emoji].splice(userIndex, 1);
+      if (msg.reactions[emoji].length === 0) delete msg.reactions[emoji];
+    }
+
+    // Broadcast updated reactions to the group
+    io.to(groupId).emit('reactionUpdate', {
+      messageId,
+      reactions: msg.reactions
+    });
+  });
+
+  // ------------------------------------------------------------
+  // TYPING
+  // ------------------------------------------------------------
   socket.on('typing', (data) => {
     const { groupId, senderName, senderId } = data;
     socket.to(groupId).emit('typing', { senderName, senderId });
   });
 
-  // --- Admin actions ---
-
-  // Rename group (only creator)
+  // ------------------------------------------------------------
+  // ADMIN ACTIONS (only creator)
+  // ------------------------------------------------------------
   socket.on('renameGroup', (data) => {
     const { groupId, newName, userId } = data;
     if (groups[groupId] && groups[groupId].createdBy === userId) {
-      const oldName = groupId;
-      // We need to handle renaming – groups are keyed by ID. We'll just change the stored name.
-      // For simplicity, we keep the same groupId but update the display name.
       groups[groupId].name = newName;
       io.to(groupId).emit('groupRenamed', { newName, groupId });
     } else {
-      socket.emit('error', { message: 'Not authorized' });
+      socket.emit('error', { message: 'Not authorized or group does not exist' });
     }
   });
 
-  // Delete group (only creator)
   socket.on('deleteGroup', (data) => {
     const { groupId, userId } = data;
     if (groups[groupId] && groups[groupId].createdBy === userId) {
-      // Notify all members, then delete
       io.to(groupId).emit('groupDeleted', { groupId });
       delete groups[groupId];
     } else {
-      socket.emit('error', { message: 'Not authorized' });
+      socket.emit('error', { message: 'Not authorized or group does not exist' });
     }
   });
 
-  // Remove member (only creator)
   socket.on('removeMember', (data) => {
     const { groupId, userId, targetUserId } = data;
     if (groups[groupId] && groups[groupId].createdBy === userId) {
@@ -135,8 +225,6 @@ io.on('connection', (socket) => {
       if (memberIndex !== -1) {
         const removed = groups[groupId].members.splice(memberIndex, 1)[0];
         io.to(groupId).emit('memberRemoved', { userId: targetUserId, name: removed.name });
-        // Also notify the removed user (they might be offline)
-        // We could send a private message or just rely on the group update.
         io.to(groupId).emit('membersUpdate', groups[groupId].members);
       }
     } else {
@@ -144,7 +232,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Add member (only creator) – we just add by userId/name (invite system simplified)
   socket.on('addMember', (data) => {
     const { groupId, userId, newUserId, newUserName } = data;
     if (groups[groupId] && groups[groupId].createdBy === userId) {
@@ -158,7 +245,9 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Leave group
+  // ------------------------------------------------------------
+  // LEAVE / DISCONNECT
+  // ------------------------------------------------------------
   socket.on('leaveGroup', () => {
     const gid = socket.data.groupId;
     const uid = socket.data.userId;
@@ -166,6 +255,8 @@ io.on('connection', (socket) => {
       groups[gid].members = groups[gid].members.filter(m => m.id !== uid);
       io.to(gid).emit('membersUpdate', groups[gid].members);
     }
+    socket.data.groupId = null;
+    socket.data.userId = null;
   });
 
   socket.on('disconnect', () => {
@@ -175,18 +266,31 @@ io.on('connection', (socket) => {
       groups[gid].members = groups[gid].members.filter(m => m.id !== uid);
       io.to(gid).emit('membersUpdate', groups[gid].members);
     }
+    console.log('❌ Disconnected:', socket.id);
   });
 });
 
+// ============================================================
+// REST ENDPOINTS
+// ============================================================
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', groups: Object.keys(groups).length });
+  res.json({
+    status: 'ok',
+    groups: Object.keys(groups).length,
+    totalMembers: Object.values(groups).reduce((acc, g) => acc + g.members.length, 0)
+  });
 });
 
 app.get('/', (req, res) => {
-  res.send('🚀 StudentNija Chat Server is running!');
+  res.send('🚀 StudentNija Chat Server with Real AI and Reactions is running!');
 });
 
+// ============================================================
+// START
+// ============================================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`   AI Proxy: ${PROXY_URL}`);
+  console.log(`   AI Model: ${AI_MODEL}`);
 });
