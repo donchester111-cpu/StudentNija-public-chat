@@ -24,16 +24,15 @@ const io = new Server(server, {
 // CONFIG
 // ============================================================
 const PROXY_URL = process.env.PROXY_URL || "https://studentnija-proxy.donchester111.workers.dev";
-const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant"; // Groq model
+const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant";
 const AI_SYSTEM_PROMPT = `You are StudentNija, an advanced AI study assistant for Nigerian students.
 You are helpful, thorough, and encouraging. Use markdown for formatting.
 If you don't know something, say so honestly. Current date: ${new Date().toLocaleDateString()}.`;
 
-// In‑memory store: groups[groupId] = { members, messages, createdBy, name }
 const groups = {};
 
 // ============================================================
-// AI HELPER (calls the proxy)
+// AI HELPER
 // ============================================================
 async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, personality = "Friendly Tutor") {
   const messages = [
@@ -66,7 +65,7 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
     }
   } catch (err) {
     console.error('AI error:', err.message);
-    return null; // caller will handle fallback
+    return null;
   }
 }
 
@@ -74,7 +73,52 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
 // SOCKET.IO
 // ============================================================
 io.on('connection', (socket) => {
-  console.log('✓ Connected:', socket.id);
+  console.log('✅ Connected:', socket.id);
+
+  // ------------------------------------------------------------
+  // CREATE GROUP
+  // ------------------------------------------------------------
+  socket.on('createGroup', (data, callback) => {
+    const { groupId, userName, userId } = data;
+
+    if (!groupId || !groupId.trim()) {
+      if (callback) callback({ success: false, error: 'Group name is required' });
+      return;
+    }
+    const trimmed = groupId.trim();
+    if (groups[trimmed]) {
+      if (callback) callback({ success: false, error: 'Group already exists' });
+      return;
+    }
+
+    // Create the group
+    groups[trimmed] = {
+      members: [{ id: userId, name: userName }],
+      messages: [],
+      createdBy: userId,
+      name: trimmed
+    };
+
+    // Join the creator to the socket room
+    socket.join(trimmed);
+    socket.data.groupId = trimmed;
+    socket.data.userName = userName;
+    socket.data.userId = userId;
+
+    // Send back success and the group state
+    if (callback) {
+      callback({
+        success: true,
+        groupId: trimmed,
+        members: groups[trimmed].members,
+        messages: [],
+        createdBy: userId
+      });
+    }
+
+    // Optionally broadcast to the group (only the creator is in it)
+    io.to(trimmed).emit('membersUpdate', groups[trimmed].members);
+  });
 
   // ------------------------------------------------------------
   // JOIN GROUP (only if exists)
@@ -115,7 +159,7 @@ io.on('connection', (socket) => {
       senderName,
       text,
       timestamp: timestamp || new Date().toISOString(),
-      reactions: {} // initial empty reactions
+      reactions: {}
     };
 
     if (groups[groupId]) {
@@ -126,12 +170,11 @@ io.on('connection', (socket) => {
   });
 
   // ------------------------------------------------------------
-  // AI REQUEST – real AI via proxy
+  // AI REQUEST
   // ------------------------------------------------------------
   socket.on('requestAI', async (data) => {
     const { groupId, prompt, context = '', personality = 'Friendly Tutor' } = data;
 
-    // Build full prompt with context
     let fullPrompt = prompt;
     if (context) {
       fullPrompt = `Previous messages:\n${context}\n\nUser question: ${prompt}`;
@@ -139,13 +182,13 @@ io.on('connection', (socket) => {
 
     let aiReply = await callAIHelper(fullPrompt, AI_SYSTEM_PROMPT, personality);
     if (!aiReply) {
-      aiReply = `I'm sorry, I couldn't reach my AI brain right now. Please try again later.`;
+      aiReply = `🤖 I'm sorry, I couldn't reach my AI brain right now. Please try again later.`;
     }
 
     const message = {
       id: Date.now().toString(36) + Math.random().toString(36).substr(2, 4),
       senderId: 'ai_bot',
-      senderName: '✦ StudentNija AI',
+      senderName: '🤖 StudentNija AI',
       text: aiReply,
       timestamp: new Date().toISOString(),
       reactions: {}
@@ -159,7 +202,7 @@ io.on('connection', (socket) => {
   });
 
   // ------------------------------------------------------------
-  // REACTION – toggle emoji reaction on a message
+  // REACTION
   // ------------------------------------------------------------
   socket.on('react', (data) => {
     const { groupId, messageId, emoji, userId } = data;
@@ -172,15 +215,12 @@ io.on('connection', (socket) => {
 
     const userIndex = msg.reactions[emoji].indexOf(userId);
     if (userIndex === -1) {
-      // add reaction
       msg.reactions[emoji].push(userId);
     } else {
-      // remove reaction (toggle)
       msg.reactions[emoji].splice(userIndex, 1);
       if (msg.reactions[emoji].length === 0) delete msg.reactions[emoji];
     }
 
-    // Broadcast updated reactions to the group
     io.to(groupId).emit('reactionUpdate', {
       messageId,
       reactions: msg.reactions
@@ -196,7 +236,7 @@ io.on('connection', (socket) => {
   });
 
   // ------------------------------------------------------------
-  // ADMIN ACTIONS (only creator)
+  // ADMIN ACTIONS
   // ------------------------------------------------------------
   socket.on('renameGroup', (data) => {
     const { groupId, newName, userId } = data;
@@ -282,12 +322,9 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('🚀 StudentNija Chat Server with Real AI and Reactions is running!');
+  res.send('🚀 StudentNija Chat Server with Real AI, Reactions & Group Creation!');
 });
 
-// ============================================================
-// START
-// ============================================================
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
