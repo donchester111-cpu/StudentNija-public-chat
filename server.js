@@ -17,11 +17,30 @@ const io = new Server(server, {
 });
 
 // ============================================================
+// ENVIRONMENT CHECKS
+// ============================================================
+const requiredEnvVars = ['DATABASE_URL'];
+const missing = requiredEnvVars.filter(v => !process.env[v]);
+if (missing.length) {
+  console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
+  console.error('   Please set them in Render dashboard -> Environment.');
+  process.exit(1);
+}
+
+if (!process.env.ALOC_ACCESS_TOKEN) {
+  console.warn('⚠️ ALOC_ACCESS_TOKEN not set – past questions will use fallback only.');
+}
+
+// ============================================================
 // POSTGRES CONNECTION
 // ============================================================
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
+});
+
+pool.on('error', (err) => {
+  console.error('❌ PostgreSQL pool error:', err);
 });
 
 // ============================================================
@@ -88,15 +107,16 @@ async function initDatabase() {
         PRIMARY KEY (exam, subject, year)
       );
     `);
-    console.log('✓ Database tables ready');
+    console.log('✅ Database tables ready');
   } catch (err) {
     console.error('❌ DB init error:', err);
+    process.exit(1); // exit if DB fails
   }
 }
 initDatabase();
 
 // ============================================================
-// IN‑MEMORY GROUPS
+// IN‑MEMORY GROUPS (loaded from DB on startup)
 // ============================================================
 const groups = {};
 
@@ -148,9 +168,9 @@ async function loadGroupsFromDB() {
         groups[g.id].pinned = pinRes.rows[0].message_id;
       }
     }
-    console.log(`✓ Loaded ${Object.keys(groups).length} groups from DB`);
+    console.log(`✅ Loaded ${Object.keys(groups).length} groups from DB`);
   } catch (err) {
-    console.error('❌ Error loading groups:', err);
+    console.error('❌ Error loading groups from DB:', err);
   }
 }
 loadGroupsFromDB();
@@ -158,26 +178,30 @@ loadGroupsFromDB();
 async function saveGroupToDB(groupId) {
   const g = groups[groupId];
   if (!g) return;
-  await pool.query(
-    `INSERT INTO groups (id, name, description, avatar, created_by)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (id) DO UPDATE SET
-       name = EXCLUDED.name,
-       description = EXCLUDED.description,
-       avatar = EXCLUDED.avatar`,
-    [groupId, g.name, g.description, g.avatar, g.createdBy]
-  );
-  await pool.query('DELETE FROM group_members WHERE group_id = $1', [groupId]);
-  for (const m of g.members) {
+  try {
     await pool.query(
-      'INSERT INTO group_members (group_id, user_id, user_name, is_admin) VALUES ($1, $2, $3, $4)',
-      [groupId, m.id, m.name, g.admins.includes(m.id)]
+      `INSERT INTO groups (id, name, description, avatar, created_by)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET
+         name = EXCLUDED.name,
+         description = EXCLUDED.description,
+         avatar = EXCLUDED.avatar`,
+      [groupId, g.name, g.description, g.avatar, g.createdBy]
     );
+    await pool.query('DELETE FROM group_members WHERE group_id = $1', [groupId]);
+    for (const m of g.members) {
+      await pool.query(
+        'INSERT INTO group_members (group_id, user_id, user_name, is_admin) VALUES ($1, $2, $3, $4)',
+        [groupId, m.id, m.name, g.admins.includes(m.id)]
+      );
+    }
+  } catch (err) {
+    console.error('❌ Error saving group to DB:', err);
   }
 }
 
 // ============================================================
-// AI HELPER
+// AI HELPER (unchanged)
 // ============================================================
 const PROXY_URL = process.env.PROXY_URL || "https://studentnija-proxy.donchester111.workers.dev";
 const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant";
@@ -210,10 +234,10 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
 }
 
 // ============================================================
-// SOCKET.IO
+// SOCKET.IO (full implementation)
 // ============================================================
 io.on('connection', (socket) => {
-  console.log('✓ Connected:', socket.id);
+  console.log('✅ Connected:', socket.id);
 
   socket.on('createGroup', async (data, callback) => {
     const { groupId, userName, userId, description = '', avatar = '' } = data;
@@ -543,6 +567,7 @@ app.get('/api/past-questions', async (req, res) => {
   const type = examMap[exam.toLowerCase()] || 'utme';
 
   try {
+    // Check DB cache
     const cacheResult = await pool.query(
       'SELECT questions FROM past_questions_cache WHERE exam = $1 AND subject = $2 AND year = $3',
       [exam, subject, year]
@@ -598,6 +623,18 @@ app.get('/', (req, res) => {
 // START SERVER
 // ============================================================
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server on port ${PORT}`);
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 SIGTERM received, closing server gracefully...');
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+  console.log(`   Database: ${process.env.DATABASE_URL ? '✅ connected' : '❌ missing'}`);
+  console.log(`   ALOC: ${process.env.ALOC_ACCESS_TOKEN ? '✅ token set' : '⚠️ token missing (fallback only)'}`);
 });
