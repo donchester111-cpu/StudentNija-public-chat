@@ -48,6 +48,7 @@ pool.on('error', (err) => {
 // ============================================================
 async function initDatabase() {
   try {
+    // Groups table
     await pool.query(`
       CREATE TABLE IF NOT EXISTS groups (
         id TEXT PRIMARY KEY,
@@ -58,6 +59,7 @@ async function initDatabase() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+    // Group members
     await pool.query(`
       CREATE TABLE IF NOT EXISTS group_members (
         group_id TEXT REFERENCES groups(id) ON DELETE CASCADE,
@@ -68,6 +70,7 @@ async function initDatabase() {
         PRIMARY KEY (group_id, user_id)
       );
     `);
+    // Group messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS group_messages (
         id TEXT PRIMARY KEY,
@@ -83,6 +86,7 @@ async function initDatabase() {
         deleted_for TEXT[] DEFAULT '{}'
       );
     `);
+    // Message reactions
     await pool.query(`
       CREATE TABLE IF NOT EXISTS message_reactions (
         message_id TEXT REFERENCES group_messages(id) ON DELETE CASCADE,
@@ -91,12 +95,14 @@ async function initDatabase() {
         PRIMARY KEY (message_id, user_id, emoji)
       );
     `);
+    // Group pins
     await pool.query(`
       CREATE TABLE IF NOT EXISTS group_pins (
         group_id TEXT PRIMARY KEY REFERENCES groups(id) ON DELETE CASCADE,
         message_id TEXT REFERENCES group_messages(id) ON DELETE CASCADE
       );
     `);
+    // Past questions cache (permanent)
     await pool.query(`
       CREATE TABLE IF NOT EXISTS past_questions_cache (
         exam TEXT NOT NULL,
@@ -110,7 +116,7 @@ async function initDatabase() {
     console.log('✅ Database tables ready');
   } catch (err) {
     console.error('❌ DB init error:', err);
-    process.exit(1); // exit if DB fails
+    process.exit(1);
   }
 }
 initDatabase();
@@ -134,9 +140,14 @@ async function loadGroupsFromDB() {
         admins: [],
         pinned: null
       };
-      const membersRes = await pool.query('SELECT user_id, user_name, is_admin FROM group_members WHERE group_id = $1', [g.id]);
+      // Load members
+      const membersRes = await pool.query(
+        'SELECT user_id, user_name, is_admin FROM group_members WHERE group_id = $1',
+        [g.id]
+      );
       groups[g.id].members = membersRes.rows.map(m => ({ id: m.user_id, name: m.user_name }));
       groups[g.id].admins = membersRes.rows.filter(m => m.is_admin).map(m => m.user_id);
+      // Load messages (last 50)
       const msgRes = await pool.query(
         `SELECT * FROM group_messages WHERE group_id = $1 AND deleted = false ORDER BY timestamp DESC LIMIT 50`,
         [g.id]
@@ -154,8 +165,12 @@ async function loadGroupsFromDB() {
         deletedFor: m.deleted_for || [],
         reactions: {}
       }));
+      // Load reactions
       for (const msg of groups[g.id].messages) {
-        const reactRes = await pool.query('SELECT user_id, emoji FROM message_reactions WHERE message_id = $1', [msg.id]);
+        const reactRes = await pool.query(
+          'SELECT user_id, emoji FROM message_reactions WHERE message_id = $1',
+          [msg.id]
+        );
         const reactions = {};
         reactRes.rows.forEach(r => {
           if (!reactions[r.emoji]) reactions[r.emoji] = [];
@@ -163,6 +178,7 @@ async function loadGroupsFromDB() {
         });
         msg.reactions = reactions;
       }
+      // Load pinned message
       const pinRes = await pool.query('SELECT message_id FROM group_pins WHERE group_id = $1', [g.id]);
       if (pinRes.rows.length) {
         groups[g.id].pinned = pinRes.rows[0].message_id;
@@ -201,7 +217,7 @@ async function saveGroupToDB(groupId) {
 }
 
 // ============================================================
-// AI HELPER (unchanged)
+// AI HELPER
 // ============================================================
 const PROXY_URL = process.env.PROXY_URL || "https://studentnija-proxy.donchester111.workers.dev";
 const AI_MODEL = process.env.AI_MODEL || "llama-3.1-8b-instant";
@@ -234,11 +250,12 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
 }
 
 // ============================================================
-// SOCKET.IO (full implementation)
+// SOCKET.IO – Full Chat Implementation
 // ============================================================
 io.on('connection', (socket) => {
   console.log('✅ Connected:', socket.id);
 
+  // ---- CREATE GROUP ----
   socket.on('createGroup', async (data, callback) => {
     const { groupId, userName, userId, description = '', avatar = '' } = data;
     const trimmed = groupId?.trim();
@@ -265,6 +282,7 @@ io.on('connection', (socket) => {
     io.to(trimmed).emit('membersUpdate', groups[trimmed].members);
   });
 
+  // ---- JOIN GROUP ----
   socket.on('joinGroup', async (data) => {
     const { groupId, userName, userId } = data;
     if (!groups[groupId]) return socket.emit('groupNotFound', { groupId });
@@ -290,6 +308,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('membersUpdate', groups[groupId].members);
   });
 
+  // ---- SEND MESSAGE ----
   socket.on('sendMessage', async (data) => {
     const { groupId, text, senderName, senderId, timestamp, replyToId } = data;
     if (!groups[groupId]) return;
@@ -331,6 +350,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('newMessage', message);
   });
 
+  // ---- AI REQUEST ----
   socket.on('requestAI', async (data) => {
     const { groupId, prompt, context = '', personality = 'Friendly Tutor', senderName, senderId } = data;
     if (!groups[groupId]) return;
@@ -372,6 +392,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('newMessage', message);
   });
 
+  // ---- REACTION ----
   socket.on('react', async (data) => {
     const { groupId, messageId, emoji, userId } = data;
     if (!groups[groupId]) return;
@@ -398,6 +419,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('reactionUpdate', { messageId, reactions: msg.reactions });
   });
 
+  // ---- EDIT MESSAGE ----
   socket.on('editMessage', async (data) => {
     const { groupId, messageId, newText, userId } = data;
     if (!groups[groupId]) return;
@@ -413,6 +435,7 @@ io.on('connection', (socket) => {
     io.to(groupId).emit('messageEdited', { messageId, newText, editedAt: msg.editedAt });
   });
 
+  // ---- DELETE MESSAGE ----
   socket.on('deleteMessage', async (data) => {
     const { groupId, messageId, userId, forAll } = data;
     if (!groups[groupId]) return;
@@ -437,6 +460,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ---- PIN / UNPIN ----
   socket.on('pinMessage', async (data) => {
     const { groupId, messageId, userId } = data;
     if (!groups[groupId]) return;
@@ -458,6 +482,7 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ---- ADMIN ACTIONS ----
   socket.on('toggleAdmin', async (data) => {
     const { groupId, userId, targetUserId, add } = data;
     if (!groups[groupId] || groups[groupId].createdBy !== userId) return socket.emit('error', { message: 'Not authorized' });
@@ -521,11 +546,13 @@ io.on('connection', (socket) => {
     } else socket.emit('error', { message: 'Not authorized' });
   });
 
+  // ---- TYPING ----
   socket.on('typing', (data) => {
     const { groupId, senderName, senderId } = data;
     socket.to(groupId).emit('typing', { senderName, senderId });
   });
 
+  // ---- LEAVE / DISCONNECT ----
   socket.on('leaveGroup', async () => {
     const gid = socket.data.groupId;
     const uid = socket.data.userId;
@@ -550,7 +577,7 @@ io.on('connection', (socket) => {
 });
 
 // ============================================================
-// REST API – ALOC PROXY with DB cache (permanent)
+// REST API – ALOC PROXY with DB cache + format transformation
 // ============================================================
 app.get('/api/past-questions', async (req, res) => {
   const { exam, subject, year } = req.query;
@@ -560,14 +587,14 @@ app.get('/api/past-questions', async (req, res) => {
 
   const token = process.env.ALOC_ACCESS_TOKEN;
   if (!token) {
-    return res.status(500).json({ error: 'ALOC token not configured' });
+    return res.status(500).json({ error: 'ALOC token not configured on server' });
   }
 
   const examMap = { jamb: 'utme', waec: 'wassce', neco: 'neco' };
   const type = examMap[exam.toLowerCase()] || 'utme';
 
   try {
-    // Check DB cache
+    // 1️⃣ Check PostgreSQL cache (permanent)
     const cacheResult = await pool.query(
       'SELECT questions FROM past_questions_cache WHERE exam = $1 AND subject = $2 AND year = $3',
       [exam, subject, year]
@@ -577,6 +604,7 @@ app.get('/api/past-questions', async (req, res) => {
       return res.json({ questions: cacheResult.rows[0].questions });
     }
 
+    // 2️⃣ Fetch from ALOC
     console.log(`📡 Fetching from ALOC: ${subject} ${year} ${type}`);
     const url = `https://questions.aloc.com.ng/api/v2/q/50?subject=${encodeURIComponent(subject)}&year=${year}&type=${type}`;
     const response = await fetch(url, {
@@ -585,12 +613,39 @@ app.get('/api/past-questions', async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
+      console.error('❌ ALOC error:', response.status, errorText);
       return res.status(response.status).json({ error: errorText || 'ALOC error' });
     }
 
     const data = await response.json();
-    const questions = data.data || data.questions || [];
 
+    // 3️⃣ Transform ALOC format to frontend format
+    const rawQuestions = data.data || data.questions || [];
+    const questions = rawQuestions.map(q => {
+      // Extract options from the `option` object
+      const options = [
+        q.option?.A || '',
+        q.option?.B || '',
+        q.option?.C || '',
+        q.option?.D || ''
+      ];
+      // Determine correctOption index from answer letter
+      let correctOption = 0;
+      if (q.answer === 'A') correctOption = 0;
+      else if (q.answer === 'B') correctOption = 1;
+      else if (q.answer === 'C') correctOption = 2;
+      else if (q.answer === 'D') correctOption = 3;
+      return {
+        question: q.question,
+        options: options,
+        correctOption: correctOption,
+        explanation: q.explanation || ''
+      };
+    });
+
+    console.log(`✅ ALOC returned ${questions.length} transformed questions`);
+
+    // 4️⃣ Cache in PostgreSQL (permanent)
     if (questions.length > 0) {
       await pool.query(
         `INSERT INTO past_questions_cache (exam, subject, year, questions)
@@ -637,4 +692,4 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Server listening on port ${PORT}`);
   console.log(`   Database: ${process.env.DATABASE_URL ? '✅ connected' : '❌ missing'}`);
   console.log(`   ALOC: ${process.env.ALOC_ACCESS_TOKEN ? '✅ token set' : '⚠️ token missing (fallback only)'}`);
-});
+        });
