@@ -243,22 +243,25 @@ async function callAIHelper(userPrompt, systemPrompt = AI_SYSTEM_PROMPT, persona
 // AI FALLBACK – generate options for questions missing them
 // ============================================================
 async function generateOptionsForQuestions(questions, subject, exam) {
-  const qs = questions.filter(q => q.options.every(o => !o || o.trim() === ''));
+  const qs = questions.filter(q => 
+    !q.options || q.options.length < 4 || q.options.some(o => !o || o.trim() === '')
+  );
   if (qs.length === 0) return questions;
 
-  const prompt = `For each of the following questions about "${subject}" (${exam.toUpperCase()} exam), generate 4 answer options (A, B, C, D) and the correct option index (0‑3). Return a JSON array in the same order as the questions:
-${qs.map((q, i) => `${i+1}. ${q.question}`).join('\n')}
-
-Format: [{"options":["A) ...","B) ...","C) ...","D) ..."], "correctOption":0}]`;
+  const prompt = `For each of the following questions about "${subject}" (${exam.toUpperCase()} exam), generate 4 answer options (A, B, C, D) and the index (0-3) of the correct option. Return ONLY a JSON array in the same order as the questions. Example: [{"options":["A) answer1","B) answer2","C) answer3","D) answer4"], "correctOption":0}].
+Questions:
+${qs.map((q, i) => `${i+1}. ${q.question}`).join('\n')}`;
 
   try {
     const result = await callAIHelper(prompt, 'quiz', '');
+    console.log('🤖 AI response for options:', result ? result.substring(0, 300) : 'null');
     const jsonMatch = result.match(/\[[\s\S]*\]/);
     if (jsonMatch) {
       const aiData = JSON.parse(jsonMatch[0]);
       let aiIndex = 0;
       return questions.map(q => {
-        if (q.options.every(o => !o || o.trim() === '')) {
+        const needsOptions = !q.options || q.options.length < 4 || q.options.some(o => !o || o.trim() === '');
+        if (needsOptions) {
           const ai = aiData[aiIndex++] || { options: ['A) Not available', 'B) Not available', 'C) Not available', 'D) Not available'], correctOption: 0 };
           return { ...q, options: ai.options, correctOption: ai.correctOption };
         }
@@ -588,7 +591,7 @@ io.on('connection', (socket) => {
 });
 
 // ============================================================
-// REST API – ALOC PROXY with cache + AI option generation
+// REST API – ALOC PROXY with cache validation & AI option fill
 // ============================================================
 app.get('/api/past-questions', async (req, res) => {
   const { exam, subject, year } = req.query;
@@ -605,14 +608,25 @@ app.get('/api/past-questions', async (req, res) => {
   const type = examMap[exam.toLowerCase()] || 'utme';
 
   try {
-    // 1️⃣ Check PostgreSQL cache
+    // 1️⃣ Check PostgreSQL cache – validate options
     const cacheResult = await pool.query(
       'SELECT questions FROM past_questions_cache WHERE exam = $1 AND subject = $2 AND year = $3',
       [exam, subject, year]
     );
     if (cacheResult.rows.length > 0) {
-      console.log(`✅ Cache hit (permanent): ${exam} ${subject} ${year}`);
-      return res.json({ questions: cacheResult.rows[0].questions });
+      const cachedQuestions = cacheResult.rows[0].questions;
+      // Check if ANY question has missing or empty options
+      const hasMissingOptions = cachedQuestions.some(q => 
+        !q.options || q.options.length < 4 || q.options.some(o => !o || o.trim() === '')
+      );
+      if (!hasMissingOptions) {
+        console.log(`✅ Cache hit (valid): ${exam} ${subject} ${year}`);
+        return res.json({ questions: cachedQuestions });
+      } else {
+        console.log(`⚠️ Cache hit but missing options – re‑fetching from ALOC`);
+        // Delete the bad cache entry
+        await pool.query('DELETE FROM past_questions_cache WHERE exam = $1 AND subject = $2 AND year = $3', [exam, subject, year]);
+      }
     }
 
     // 2️⃣ Fetch from ALOC
@@ -629,25 +643,56 @@ app.get('/api/past-questions', async (req, res) => {
     }
 
     const data = await response.json();
+    
+    // 🔍 DEBUG: Log the full ALOC response (first 1000 chars to avoid bloating logs)
+    console.log('📄 ALOC response structure:', JSON.stringify(data, null, 2).substring(0, 1000));
 
-    // 3️⃣ Transform ALOC format
+    // 3️⃣ Transform ALOC format – robust option extraction
     const rawQuestions = data.data || data.questions || [];
     console.log(`📦 Raw questions from ALOC: ${rawQuestions.length}`);
 
-    let questions = rawQuestions.map(q => {
+    let questions = rawQuestions.map((q, index) => {
       let options = [];
+      
+      // Try to extract options from various formats
       if (q.option && typeof q.option === 'object') {
-        options = [q.option.A || '', q.option.B || '', q.option.C || '', q.option.D || ''];
-      } else if (q.options && Array.isArray(q.options)) {
+        // Format: { option: { A: "...", B: "...", C: "...", D: "..." } }
+        options = [
+          q.option.A || q.option.a || '',
+          q.option.B || q.option.b || '',
+          q.option.C || q.option.c || '',
+          q.option.D || q.option.d || ''
+        ];
+      } else if (q.options && typeof q.options === 'object') {
+        // Format: { options: { A: "...", B: "...", C: "...", D: "..." } }
+        options = [
+          q.options.A || q.options.a || '',
+          q.options.B || q.options.b || '',
+          q.options.C || q.options.c || '',
+          q.options.D || q.options.d || ''
+        ];
+      } else if (Array.isArray(q.options)) {
+        // Format: { options: ["A) ...", "B) ...", "C) ...", "D) ..."] }
         options = q.options;
       } else {
+        // Fallback: try to extract from any field
         options = ['', '', '', ''];
       }
+
+      // Determine correctOption index from answer letter
       let correctOption = 0;
-      if (q.answer === 'A') correctOption = 0;
-      else if (q.answer === 'B') correctOption = 1;
-      else if (q.answer === 'C') correctOption = 2;
-      else if (q.answer === 'D') correctOption = 3;
+      if (q.answer === 'A' || q.answer === 'a') correctOption = 0;
+      else if (q.answer === 'B' || q.answer === 'b') correctOption = 1;
+      else if (q.answer === 'C' || q.answer === 'c') correctOption = 2;
+      else if (q.answer === 'D' || q.answer === 'd') correctOption = 3;
+
+      // Log first question for debugging
+      if (index === 0) {
+        console.log('🔍 First question structure:', JSON.stringify(q, null, 2));
+        console.log('📊 Extracted options:', options);
+        console.log('🎯 Correct option index:', correctOption);
+      }
+
       return {
         question: q.question || 'Question text not available',
         options: options,
@@ -659,8 +704,10 @@ app.get('/api/past-questions', async (req, res) => {
     console.log(`📦 Transformed ${questions.length} questions from ALOC`);
 
     // 4️⃣ Check for missing options – use AI to generate them
-    const hasEmptyOptions = questions.some(q => q.options.every(o => !o || o.trim() === ''));
-    if (hasEmptyOptions) {
+    const hasMissingOptions = questions.some(q => 
+      !q.options || q.options.length < 4 || q.options.some(o => !o || o.trim() === '')
+    );
+    if (hasMissingOptions) {
       console.log('⚠️ Some questions missing options – generating options with AI...');
       questions = await generateOptionsForQuestions(questions, subject, exam);
       const filled = questions.filter(q => q.options.every(o => o && o.trim() !== ''));
